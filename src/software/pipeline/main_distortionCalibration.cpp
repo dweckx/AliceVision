@@ -58,7 +58,8 @@ void processPerspective(const calibration::CheckerDetector & detector, std::shar
 
     std::vector<calibration::PointPair> pointPairs;
 
-    Eigen::Matrix4d T = Eigen::Matrix4d::Identity();
+    Eigen::Matrix3d R = Eigen::Matrix3d::Identity();
+    Eigen::Vector3d t = Eigen::Vector3d::Zero();
     
 
     Eigen::Vector2d centerBoard;
@@ -100,15 +101,15 @@ void processPerspective(const calibration::CheckerDetector & detector, std::shar
     }
 
     double scale = maxx - minx;
-    T(2, 3) = 1.0 / scale;
+    
+    t(2) = 1.0;
     
     calibration::Statistics statistics;
-
 
     // Lock distortion but estimate pose
     {
         std::vector<bool> locks = {true, true, true, true, true, true, true, true, true, true, true, false, true};
-        calibration::estimate(undistortion, statistics, pointPairs, true, locks, T, true);
+        calibration::estimate(undistortion, statistics, pointPairs, true, locks, R, t, scale);
 
         ALICEVISION_LOG_INFO("Result quality of calibration: ");
         ALICEVISION_LOG_INFO("Mean of error (stddev): " << statistics.mean << "(" << statistics.stddev << ")");
@@ -120,7 +121,7 @@ void processPerspective(const calibration::CheckerDetector & detector, std::shar
     // Estimate pose and distortion
     {
         std::vector<bool> locks = {false, false, false, false, false, false, false, false, false, false, false, false, true};
-        calibration::estimate(undistortion, statistics, pointPairs, true, locks, T, false);
+        calibration::estimate(undistortion, statistics, pointPairs, true, locks, R, t, scale);
 
         ALICEVISION_LOG_INFO("Result quality of calibration: ");
         ALICEVISION_LOG_INFO("Mean of error (stddev): " << statistics.mean << "(" << statistics.stddev << ")");

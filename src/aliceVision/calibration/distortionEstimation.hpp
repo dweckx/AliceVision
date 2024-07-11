@@ -127,7 +127,9 @@ bool estimate(std::shared_ptr<camera::Undistortion> undistortionToEstimate,
               const std::vector<PointPair>& pointpairs,
               const bool lockCenter,
               const std::vector<bool>& lockDistortions,
-              Eigen::Matrix4d & T, bool useRight);
+              Eigen::Matrix3d & R, 
+              Eigen::Vector3d & t,
+              double &scale);
 
 }  // namespace calibration
 }  // namespace aliceVision

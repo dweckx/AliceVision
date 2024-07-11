@@ -7,7 +7,7 @@
 #include "distortionEstimation.hpp"
 
 #include <aliceVision/system/Logger.hpp>
-#include <aliceVision/sfm/bundle/manifolds/se3.hpp>
+#include <aliceVision/sfm/bundle/manifolds/so3.hpp>
 
 #include <ceres/ceres.h>
 
@@ -366,32 +366,37 @@ private:
 class CostPointGeometry : public ceres::CostFunction
 {
 public:
-    CostPointGeometry(std::shared_ptr<camera::Undistortion> & undistortion, const Vec2& ptUndistorted, const Vec2 &ptDistorted, bool poseRight)
+    CostPointGeometry(std::shared_ptr<camera::Undistortion> & undistortion, const Vec2& ptUndistorted, const Vec2 &ptDistorted)
         : _ptUndistorted(ptUndistorted)
         , _ptDistorted(ptDistorted)
         , _undistortion(undistortion)
-        , _poseRight(poseRight)
     {
         set_num_residuals(2);
         mutable_parameter_block_sizes()->push_back(2);
         mutable_parameter_block_sizes()->push_back(undistortion->getUndistortionParametersCount());
         mutable_parameter_block_sizes()->push_back(1);
         mutable_parameter_block_sizes()->push_back(1);
-        mutable_parameter_block_sizes()->push_back(16);
+        mutable_parameter_block_sizes()->push_back(1);
+        mutable_parameter_block_sizes()->push_back(9);
+        mutable_parameter_block_sizes()->push_back(3);
     }
 
     bool Evaluate(double const* const* parameters, double* residuals, double** jacobians) const override
     {
         const double* parameter_center = parameters[0];
         const double* parameter_disto = parameters[1];
-        const double* parameter_offsetx = parameters[2];
-        const double* parameter_offsety = parameters[3];
-        const double* parameter_pose = parameters[4];
+        const double* parameter_scale = parameters[2];
+        const double* parameter_offsetx = parameters[3];
+        const double* parameter_offsety = parameters[4];
+        const double* parameter_rotation = parameters[5];
+        const double* parameter_translation = parameters[6];
 
+        const double scale = *parameter_scale;
         const double offsetx = *parameter_offsetx;
         const double offsety = *parameter_offsety;
 
-        const Eigen::Map<const SE3::Matrix> T(parameter_pose);
+        const Eigen::Map<const SO3::Matrix> R(parameter_rotation);
+        const Eigen::Map<const Eigen::Vector3d> t(parameter_translation);
 
         const int undistortionSize = _undistortion->getUndistortionParametersCount();
 
@@ -417,19 +422,18 @@ public:
         //Estimate measure
         const Vec2 ipt = _ptUndistorted;
                 
-        Vec4 ipt4;
-        ipt4.x() = ipt.x();
-        ipt4.y() = ipt.y();
-        ipt4.z() = 0.0;
-        ipt4.w() = 1.0;
+        Vec3 ipt3;
+        ipt3.x() = ipt.x();
+        ipt3.y() = ipt.y();
+        ipt3.z() = 0.0;
 
-        const Vec4 tpt = T * ipt4;
+        const Vec3 tpt = R * ipt3 + t;
         
         Vec2 projected = tpt.head(2) / tpt(2);
         Vec2 scaled;
 
-        scaled.x() = projected.x() + offsetx;
-        scaled.y() = pa * projected.y() + offsety;
+        scaled.x() = scale * projected.x() + offsetx;
+        scaled.y() = pa * scale * projected.y() + offsety;
                 
         const double w = 1 + ipt.norm();
 
@@ -457,10 +461,20 @@ public:
             J = w * _undistortion->getDerivativeUndistortWrtParameters(_ptDistorted);
         }
 
-
         if (jacobians[2] != nullptr)
         {
             Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(jacobians[2], 2, 1);
+            
+            Vec2 d_scaled_d_scale;
+            d_scaled_d_scale(0) = projected.x();
+            d_scaled_d_scale(1) = pa * projected.y();
+            
+            J = -w * d_scaled_d_scale;
+        }
+
+        if (jacobians[3] != nullptr)
+        {
+            Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(jacobians[3], 2, 1);
             
             Vec2 d_scaled_d_offsetx;
             d_scaled_d_offsetx(0) = 1.0;
@@ -469,9 +483,9 @@ public:
             J = -w * d_scaled_d_offsetx;
         }
 
-        if (jacobians[3] != nullptr)
+        if (jacobians[4] != nullptr)
         {
-            Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(jacobians[3], 2, 1);
+            Eigen::Map<Eigen::Matrix<double, Eigen::Dynamic, Eigen::Dynamic, Eigen::RowMajor>> J(jacobians[4], 2, 1);
             
             Vec2 d_scaled_d_offsety;
             d_scaled_d_offsety(0) = 0.0;
@@ -480,47 +494,62 @@ public:
             J = -w * d_scaled_d_offsety;
         }
 
-        if (jacobians[4] != nullptr)
+        if (jacobians[5] != nullptr)
         {
-            Eigen::Map<Eigen::Matrix<double, 2, 16, Eigen::RowMajor>> J(jacobians[4]);
+            Eigen::Map<Eigen::Matrix<double, 2, 9, Eigen::RowMajor>> J(jacobians[5]);
             
-            Eigen::Matrix<double, 2, 4> d_projected_d_tpt;
+            Eigen::Matrix<double, 2, 3> d_projected_d_tpt;
             d_projected_d_tpt(0, 0) = 1.0 / tpt.z();
             d_projected_d_tpt(0, 1) = 0.0;
             d_projected_d_tpt(0, 2) = - tpt.x() / (tpt.z() * tpt.z());
-            d_projected_d_tpt(0, 3) = 0.0;
             d_projected_d_tpt(1, 0) = 0.0;
             d_projected_d_tpt(1, 1) = 1.0 / tpt.z();
             d_projected_d_tpt(1, 2) = - tpt.y() / (tpt.z() * tpt.z());
-            d_projected_d_tpt(1, 3) = 0.0;
 
-            Eigen::Matrix<double, 4, 2> d_ipt4_d_ipt;
-            d_ipt4_d_ipt(0, 0) = 1;
-            d_ipt4_d_ipt(0, 1) = 0;
-            d_ipt4_d_ipt(1, 0) = 0;
-            d_ipt4_d_ipt(1, 1) = 1;
-            d_ipt4_d_ipt(2, 0) = 0;
-            d_ipt4_d_ipt(2, 1) = 0;
-            d_ipt4_d_ipt(3, 0) = 0;
-            d_ipt4_d_ipt(3, 1) = 0;
+            Eigen::Matrix<double, 3, 2> d_ipt3_d_ipt;
+            d_ipt3_d_ipt(0, 0) = 1;
+            d_ipt3_d_ipt(0, 1) = 0;
+            d_ipt3_d_ipt(1, 0) = 0;
+            d_ipt3_d_ipt(1, 1) = 1;
+            d_ipt3_d_ipt(2, 0) = 0;
+            d_ipt3_d_ipt(2, 1) = 0;
 
             Eigen::Matrix<double, 2, 2> d_scaled_d_projected;
-            d_scaled_d_projected(0, 0) = 1.0;
+            d_scaled_d_projected(0, 0) = scale;
             d_scaled_d_projected(0, 1) = 0;
             d_scaled_d_projected(1, 0) = 0;
-            d_scaled_d_projected(1, 1) = pa;
+            d_scaled_d_projected(1, 1) = pa * scale;
 
-            J = - w * d_scaled_d_projected * d_projected_d_tpt * getJacobian_AB_wrt_A<4, 4, 1>(T, ipt4);
+            J = - w * d_scaled_d_projected * d_projected_d_tpt * getJacobian_AB_wrt_A<3, 3, 1>(R, ipt3) * getJacobian_AB_wrt_A<3, 3, 3>(Eigen::Matrix3d::Identity(), R);
+        }
 
-            if (_poseRight)
-            {
-                J = J * getJacobian_AB_wrt_B<4, 4, 4>(T, Eigen::Matrix4d::Identity());
-            }
-            else 
-            {
-                J = J * getJacobian_AB_wrt_A<4, 4, 4>(Eigen::Matrix4d::Identity(), T);
-            }
+        if (jacobians[6] != nullptr)
+        {
+            Eigen::Map<Eigen::Matrix<double, 2, 3, Eigen::RowMajor>> J(jacobians[6]);
+            
+            Eigen::Matrix<double, 2, 3> d_projected_d_tpt;
+            d_projected_d_tpt(0, 0) = 1.0 / tpt.z();
+            d_projected_d_tpt(0, 1) = 0.0;
+            d_projected_d_tpt(0, 2) = - tpt.x() / (tpt.z() * tpt.z());
+            d_projected_d_tpt(1, 0) = 0.0;
+            d_projected_d_tpt(1, 1) = 1.0 / tpt.z();
+            d_projected_d_tpt(1, 2) = - tpt.y() / (tpt.z() * tpt.z());
 
+            Eigen::Matrix<double, 3, 2> d_ipt3_d_ipt;
+            d_ipt3_d_ipt(0, 0) = 1;
+            d_ipt3_d_ipt(0, 1) = 0;
+            d_ipt3_d_ipt(1, 0) = 0;
+            d_ipt3_d_ipt(1, 1) = 1;
+            d_ipt3_d_ipt(2, 0) = 0;
+            d_ipt3_d_ipt(2, 1) = 0;
+
+            Eigen::Matrix<double, 2, 2> d_scaled_d_projected;
+            d_scaled_d_projected(0, 0) = scale;
+            d_scaled_d_projected(0, 1) = 0;
+            d_scaled_d_projected(1, 0) = 0;
+            d_scaled_d_projected(1, 1) = pa * scale;
+
+            J = - w * d_scaled_d_projected * d_projected_d_tpt;
         }
 
         return true;
@@ -530,7 +559,6 @@ private:
     std::shared_ptr<camera::Undistortion> _undistortion;
     Vec2 _ptUndistorted;
     Vec2 _ptDistorted;
-    bool _poseRight;
 };
 
 bool estimate(std::shared_ptr<camera::Undistortion> undistortionToEstimate,
@@ -572,7 +600,7 @@ bool estimate(std::shared_ptr<camera::Undistortion> undistortionToEstimate,
     problem.AddParameterBlock(center, 2);
     if (lockCenter)
     {
-        //problem.SetParameterBlockConstant(center);
+        problem.SetParameterBlockConstant(center);
     }
 
     // Add distortion parameter
@@ -877,7 +905,9 @@ bool estimate(std::shared_ptr<camera::Undistortion> undistortionToEstimate,
               const std::vector<PointPair>& pointpairs,
               const bool lockCenter,
               const std::vector<bool>& lockDistortions,
-              Eigen::Matrix4d & T, bool useRight)
+              Eigen::Matrix3d & R, 
+              Eigen::Vector3d & t,
+              double & scale)
 {
     if (!undistortionToEstimate)
     {
@@ -953,40 +983,42 @@ bool estimate(std::shared_ptr<camera::Undistortion> undistortionToEstimate,
 
     double offsetx = undistortionToEstimate->getCenter().x();
     double offsety = undistortionToEstimate->getCenter().y();
+    
+    problem.AddParameterBlock(&scale, 1);
     problem.AddParameterBlock(&offsetx, 1);
-    problem.SetParameterBlockConstant(&offsetx);
     problem.AddParameterBlock(&offsety, 1);
+    
+    problem.SetParameterLowerBound(&offsetx, 0, offsetx - 100.0);
+    problem.SetParameterUpperBound(&offsetx, 0, offsetx + 100.0);
+    problem.SetParameterLowerBound(&offsety, 0, offsety - 100.0);
+    problem.SetParameterUpperBound(&offsety, 0, offsety + 100.0);
 
-    SE3::Matrix Tpose = T;
-    problem.AddParameterBlock(Tpose.data(), 16);
+    SO3::Matrix Rest = R;
+    Eigen::Vector3d Test = t;
 
-    if (useRight)
-    {
-        problem.SetManifold(Tpose.data(), new sfm::SE3ManifoldRight(true, true));
-    }
-    else
-    {
-        problem.SetManifold(Tpose.data(), new sfm::SE3ManifoldLeft(true, true));
-    }
+    problem.AddParameterBlock(Rest.data(), 9);
+    problem.AddParameterBlock(Test.data(), 3);
+
+    problem.SetManifold(Rest.data(), new sfm::SO3Manifold);
 
     for (auto& ppt : pointpairs)
     {
-        ceres::CostFunction* costFunction = new CostPointGeometry(undistortionToEstimate, ppt.undistortedPoint, ppt.distortedPoint, useRight);
-        problem.AddResidualBlock(costFunction, lossFunction, center, ptrUndistortionParameters, &offsetx, &offsety, Tpose.data());
+        ceres::CostFunction* costFunction = new CostPointGeometry(undistortionToEstimate, ppt.undistortedPoint, ppt.distortedPoint);
+        problem.AddResidualBlock(costFunction, lossFunction, center, ptrUndistortionParameters, &scale, &offsetx, &offsety, Rest.data(), Test.data());
     }
 
     ceres::Solver::Options options;
     options.use_inner_iterations = true;
-    options.max_num_iterations = 100;
-    options.function_tolerance = 1e-24;
+    options.max_num_iterations = 1000;
+    /*options.function_tolerance = 1e-24;
     options.parameter_tolerance = 1e-24;
-    options.gradient_tolerance = 1e-24;
+    options.gradient_tolerance = 1e-24;*/
     options.logging_type = ceres::SILENT;   
     
-
+        
     ceres::Solver::Summary summary;
     ceres::Solve(options, &problem, &summary);
-
+    
     ALICEVISION_LOG_TRACE(summary.FullReport());
 
     if (!summary.IsSolutionUsable())
@@ -1004,18 +1036,17 @@ bool estimate(std::shared_ptr<camera::Undistortion> undistortionToEstimate,
     {
         const Vec2 ipt = ppt.undistortedPoint;
         
-        Vec4 ipt4;
-        ipt4.x() = ipt.x();
-        ipt4.y() = ipt.y();
-        ipt4.z() = 0.0;
-        ipt4.w() = 1.0;
+        Vec3 ipt3;
+        ipt3.x() = ipt.x();
+        ipt3.y() = ipt.y();
+        ipt3.z() = 0.0;
 
-        const Vec4 tpt = Tpose * ipt4;
+        const Vec3 tpt = Rest * ipt3 + Test;
         
         Vec2 projected = tpt.head(2) / tpt(2);
         Vec2 scaled;
-        scaled.x() = projected.x() + offsetx;
-        scaled.y() = pa * projected.y() + offsety;
+        scaled.x() = scale * projected.x() + offsetx;
+        scaled.y() = pa * scale * projected.y() + offsety;
     
         const double res = (undistortionToEstimate->undistort(ppt.distortedPoint) - scaled).norm();
         
@@ -1036,7 +1067,14 @@ bool estimate(std::shared_ptr<camera::Undistortion> undistortionToEstimate,
     statistics.max = max;
     statistics.lastDecile = lastDecile;
 
-    T = Tpose;
+    R = Rest;
+    t = Test;
+
+    std::cout << scale << std::endl;
+    std::cout << offsetx << std::endl;
+    std::cout << offsety << std::endl;
+    std::cout << R << std::endl;
+    std::cout << t << std::endl;
     
     return true;
 }
